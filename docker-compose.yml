@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgres://aether:aether_local_password@db:5432/aether_rpg
+      SESSION_SECRET: ${SESSION_SECRET:-local-dev-only-change-this-secret-before-deploying}
+      REGISTRATION_CODE: ${REGISTRATION_CODE:-local-only-change-this-registration-code}
+      SINGLE_PLAYER_MODE: ${SINGLE_PLAYER_MODE:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aether
+      POSTGRES_PASSWORD: aether_local_password
+      POSTGRES_DB: aether_rpg
+    volumes:
+      - aether_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aether -d aether_rpg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+volumes:
+  aether_db:

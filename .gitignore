@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+npm-debug.log*
+*.log
+.cache/
+*.sqlite
+*.db
+*.dump
+*.backup

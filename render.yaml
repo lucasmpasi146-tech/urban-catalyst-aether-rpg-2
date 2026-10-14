@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: urban-catalyst-aether-rpg
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: urban-catalyst-aether-db
+          property: connectionString
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: REGISTRATION_CODE
+        sync: false
+      - key: SINGLE_PLAYER_MODE
+        value: "true"
+      - key: PGPOOL_MAX
+        value: "3"
+
+databases:
+  - name: urban-catalyst-aether-db
+    databaseName: aether_rpg
+    user: aether_user
+    plan: free
+    region: singapore

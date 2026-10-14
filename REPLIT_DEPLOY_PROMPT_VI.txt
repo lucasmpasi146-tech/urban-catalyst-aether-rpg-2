@@ -1,0 +1,17 @@
+PROMPT DÀNH CHO REPLIT AGENT — URBAN CATALYST AETHER RPG
+
+Hãy triển khai chính project hiện có trong thư mục này lên Replit. Đọc README_VI.md và REPLIT_NOTES.md trước khi thay đổi. Không viết lại giao diện game nếu không cần thiết.
+
+Mục tiêu:
+1. Chạy ứng dụng Node.js hiện tại bằng `npm install` và `npm start`.
+2. Tạo/kết nối PostgreSQL bền vững trong Replit và đặt DATABASE_URL ở Secrets/Environment, không ghi credential vào source.
+3. Tạo SESSION_SECRET là chuỗi ngẫu nhiên mạnh ít nhất 32 ký tự.
+4. Tạo REGISTRATION_CODE riêng đủ mạnh (khuyến nghị ít nhất 32 ký tự), chỉ chia sẻ với chủ tài khoản; không đưa nó vào HTML, log hay repository.
+5. Đặt NODE_ENV=production và SINGLE_PLAYER_MODE=true. PORT nên để nền tảng tự cấp nếu được hỗ trợ.
+6. Đảm bảo ứng dụng bind vào 0.0.0.0 và dùng lệnh `npm start` để chạy.
+7. Deploy/publish bằng tính năng Deploy của Replit. Sau khi deploy, mở URL công khai và kiểm tra GET /api/health phải trả ok=true và database=connected.
+8. Thử luồng: đăng ký tài khoản đầu tiên bằng REGISTRATION_CODE, đăng xuất/đăng nhập lại, tạo hoặc tải save, tải lại trang và xác nhận save được lấy từ server. Không tạo tài khoản thứ hai khi SINGLE_PLAYER_MODE=true.
+9. Báo rõ nếu plan/database/deployment của tài khoản Replit yêu cầu thao tác hoặc thanh toán thủ công. Không tự đổi cấu hình thành công khai nhiều người dùng.
+10. Không tuyên bố hoàn tất nếu /api/health không báo database connected. Ghi lại URL đã deploy và các bước cần người dùng tự xác nhận, nhưng tuyệt đối không hiển thị secret.
+
+Giới hạn bảo mật đã biết: phiên bản này là server đăng nhập + lưu game cá nhân; phần chiến đấu, EXP, rơi đồ, AP và class vẫn được tính ở trình duyệt rồi gửi trạng thái lưu. Không mô tả nó là hệ thống authoritative/chống gian lận. Giữ project ở chế độ thử nghiệm cá nhân.

@@ -1,13 +1,15 @@
 {
   "name": "urban-catalyst-aether-online",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "private": true,
-  "description": "Online save, world chat, friends and private messages for Urban Catalyst — Aether RPG",
+  "description": "Urban Catalyst Aether RPG — Admin diagnostics and secure player market, no image graphics overhaul",
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "check:structure": "node verify-structure.js",
+    "prestart": "node verify-structure.js"
   },
   "engines": {
     "node": ">=20"

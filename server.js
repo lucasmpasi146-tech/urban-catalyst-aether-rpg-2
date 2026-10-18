@@ -10,6 +10,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
+import {validateProgressDelta,validateGearUIDs,feeForPrice,LISTING_FEE_BPS,SALE_TAX_BPS,marketPriceAllowed,isOutlierPrice,ALLOWED_ROLES} from './security.mjs';
+import {GEAR_TEMPLATES,GEAR_RANKS,GEAR_RARITIES,GEAR_SPECIALS} from './gear-catalog.mjs';
+import {gearEnhancementCap,validateGearMetadata,enhancementFailureRisk,resolveEnhancementFailure,enhancementProtectionCost} from './gear-rules.mjs';
 
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
@@ -18,7 +21,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || 3000);
 const databaseUrl = process.env.DATABASE_URL;
 const sessionSecret = process.env.SESSION_SECRET;
-const GAME_VERSION = '6.6.0';
+const GAME_VERSION = '6.9.1';
 const ULR_OWNER = 'lucasmpasi146';
 const COPPER_PER_PLATINUM=1000000;
 const MAX_WALLET_COPPER=9007199254740991;
@@ -82,6 +85,7 @@ const authLimiter = rateLimit({
 const socialChatLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 25,
+  keyGenerator: req => String(req.account?.id || 'unauthenticated'),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Bạn gửi tin nhắn quá nhanh. Hãy đợi một phút rồi thử lại.' }
@@ -89,6 +93,7 @@ const socialChatLimiter = rateLimit({
 const marketActionLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 18,
+  keyGenerator: req => String(req.account?.id || 'unauthenticated'),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Giao dịch quá nhanh. Hãy đợi một phút.' }
@@ -96,6 +101,7 @@ const marketActionLimiter = rateLimit({
 const adminActionLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 20,
+  keyGenerator: req => String(req.account?.id || 'unauthenticated'),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Quá nhiều thao tác quản trị. Hãy chờ một phút rồi thử lại.' }
@@ -189,10 +195,60 @@ async function initializeDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS marketplace_one_active_uid_idx ON marketplace_listings(seller_id, item_uid) WHERE status='active';
     ALTER TABLE marketplace_listings DROP CONSTRAINT IF EXISTS marketplace_listings_price_check;
     ALTER TABLE marketplace_listings ADD CONSTRAINT marketplace_listings_price_check CHECK (price BETWEEN 10 AND 9007199254740991);
+
+    ALTER TABLE game_accounts DROP CONSTRAINT IF EXISTS game_accounts_role_check;
+    ALTER TABLE game_accounts ADD CONSTRAINT game_accounts_role_check CHECK (role IN ('player','moderator','gm','admin'));
+    CREATE TABLE IF NOT EXISTS security_incidents (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT REFERENCES game_accounts(id) ON DELETE SET NULL,
+      kind TEXT NOT NULL, details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS security_incidents_user_idx ON security_incidents(user_id,created_at DESC);
+    CREATE TABLE IF NOT EXISTS economy_uid_registry (
+      uid TEXT PRIMARY KEY, owner_id BIGINT REFERENCES game_accounts(id) ON DELETE SET NULL,
+      origin TEXT NOT NULL DEFAULT 'legacy-client', last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS gift_codes (
+      digest TEXT PRIMARY KEY, reward JSONB NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE,
+      expires_at TIMESTAMPTZ, usage_limit INTEGER CHECK (usage_limit IS NULL OR usage_limit>0),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS gift_redemptions (
+      user_id BIGINT NOT NULL REFERENCES game_accounts(id) ON DELETE CASCADE,
+      digest TEXT NOT NULL REFERENCES gift_codes(digest), redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(user_id,digest)
+    );
+    CREATE TABLE IF NOT EXISTS economy_audit_log (
+      id BIGSERIAL PRIMARY KEY, actor_id BIGINT REFERENCES game_accounts(id) ON DELETE SET NULL,
+      action VARCHAR(48) NOT NULL, delta_gold BIGINT NOT NULL DEFAULT 0,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS economy_audit_created_idx ON economy_audit_log(created_at DESC);
+    CREATE TABLE IF NOT EXISTS marketplace_notifications (
+      id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES game_accounts(id) ON DELETE CASCADE,
+      message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),read_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS marketplace_notifications_user_idx ON marketplace_notifications(user_id,id DESC);
+    ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS listing_fee BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS sales_tax BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS trade_kind TEXT NOT NULL DEFAULT 'sale';
+    ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS wanted_key TEXT;
+    ALTER TABLE marketplace_listings ADD COLUMN IF NOT EXISTS outlier BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE marketplace_listings DROP CONSTRAINT IF EXISTS marketplace_listings_status_check;
+    ALTER TABLE marketplace_listings ADD CONSTRAINT marketplace_listings_status_check CHECK (status IN ('active','sold','cancelled','quarantine'));
+    CREATE TABLE IF NOT EXISTS gm_requests (
+      id BIGSERIAL PRIMARY KEY, requester_id BIGINT NOT NULL REFERENCES game_accounts(id),
+      target_id BIGINT NOT NULL REFERENCES game_accounts(id), action TEXT NOT NULL,
+      amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+      reason VARCHAR(200), reviewed_by BIGINT REFERENCES game_accounts(id),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), reviewed_at TIMESTAMPTZ
+    );
     UPDATE game_accounts SET last_active_at = COALESCE(last_active_at, created_at);
   `);
   await migrateCurrencyV2();
   await bootstrapConfiguredAdmin();
+  await syncConfiguredGiftCodes();
 }
 
 
@@ -281,6 +337,62 @@ async function bootstrapConfiguredAdmin() {
   adminBootstrapWarning = '';
 }
 
+
+const giftCodeLimiter=rateLimit({windowMs:15*60*1000,limit:12,standardHeaders:'draft-7',legacyHeaders:false,message:{error:'Đổi mã quá nhanh, hãy chờ 15 phút.'}});
+function giftCodeDigest(code){return crypto.createHmac('sha256',process.env.GIFT_CODE_PEPPER||sessionSecret).update(String(code).trim().toUpperCase()).digest('hex');}
+async function syncConfiguredGiftCodes(){
+  const raw=process.env.GIFT_CODES_JSON;
+  if(!raw){console.warn('[GIFT] Chưa có GIFT_CODES_JSON: mã mới không được kích hoạt; mã cũ trong trình duyệt đã bị gỡ.');return;}
+  let entries;try{entries=JSON.parse(raw);}catch(_){throw new Error('GIFT_CODES_JSON phải là JSON hợp lệ.');}
+  if(!Array.isArray(entries)||entries.length>200)throw new Error('GIFT_CODES_JSON phải là mảng tối đa 200 mã.');
+  for(const entry of entries){
+    if(typeof entry?.code!=='string'||!/^[A-Z0-9_-]{4,48}$/i.test(entry.code)||!entry.reward||typeof entry.reward!=='object')throw new Error('Định dạng mã giftcode không hợp lệ.');
+    const reward={};for(const key of ['gold','shard','stones','cores','manuals','hpPotions','manaPotions','fragments']){
+      if(entry.reward[key]!==undefined){const n=Number(entry.reward[key]);if(!Number.isSafeInteger(n)||n<0||n>1000000)throw new Error(`Thưởng ${key} không hợp lệ`);reward[key]=n;}
+    }
+    if(entry.reward.sovereignClass===true)reward.sovereignClass=true; // unchanged ULR owner requirement
+    await pool.query(`INSERT INTO gift_codes(digest,reward,active,expires_at,usage_limit) VALUES($1,$2::jsonb,TRUE,$3,$4)
+      ON CONFLICT(digest) DO UPDATE SET reward=EXCLUDED.reward,expires_at=EXCLUDED.expires_at,usage_limit=EXCLUDED.usage_limit`,
+      [giftCodeDigest(entry.code),JSON.stringify(reward),entry.expiresAt||null,Number(entry.usageLimit)||null]);
+    // Existing saves may already contain codes claimed before v6.8; preserve one-use semantics.
+    await pool.query(`INSERT INTO gift_redemptions(user_id,digest)
+      SELECT user_id,$1 FROM game_saves WHERE state->'redeemedGiftCodes' ? $2
+      ON CONFLICT(user_id,digest) DO NOTHING`,[giftCodeDigest(entry.code),entry.code.toUpperCase()]);
+  }
+  console.log(`[GIFT] Nạp ${entries.length} mã từ Render Environment (không đưa mã ra client).`);
+}
+async function auditEconomy(db,actor,action,delta=0,details={}){
+  await db.query('INSERT INTO economy_audit_log(actor_id,action,delta_gold,details) VALUES($1,$2,$3,$4::jsonb)',[actor,action,delta,JSON.stringify(details)]);
+}
+async function registerSaveUIDs(db,userId,state){
+  const uids=(state.gearInventory||[]).map(x=>x.uid);
+  if(!uids.length)return null;
+  const result=await db.query(`INSERT INTO economy_uid_registry(uid,owner_id)
+    SELECT UNNEST($1::text[]),$2::bigint
+    ON CONFLICT(uid) DO UPDATE SET last_seen=NOW()
+    RETURNING uid,owner_id::text AS owner`,[uids,userId]);
+  if(result.rows.some(r=>r.owner!==String(userId)))return 'Trang bị có UID đã tồn tại tại tài khoản khác.';
+  return null;
+}
+async function logSecurityIncident(db,userId,kind,details={}){
+  await db.query('INSERT INTO security_incidents(user_id,kind,details) VALUES($1,$2,$3::jsonb)',[userId,kind,JSON.stringify(details)]);
+}
+function userCanModerate(req){return ['admin','moderator'].includes(req.account?.role);}
+function totpValid(secret,code){
+  if(!secret)return true;
+  if(!/^\d{6}$/.test(String(code||'')))return false;
+  const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';let bits=0,value=0,bytes=[];
+  for(const ch of secret.toUpperCase().replace(/\s|=/g,'')){const v=chars.indexOf(ch);if(v<0)return false;value=(value<<5)|v;bits+=5;if(bits>=8){bits-=8;bytes.push((value>>>bits)&255);}}
+  if(!bytes.length)return false;const key=Buffer.from(bytes);
+  for(let offset=-1;offset<=1;offset++){const ctr=Buffer.alloc(8);ctr.writeBigUInt64BE(BigInt(Math.floor(Date.now()/30000)+offset));const mac=crypto.createHmac('sha1',key).update(ctr).digest();const n=mac[mac.length-1]&15;const val=(mac.readUInt32BE(n)&0x7fffffff)%1000000;if(String(val).padStart(6,'0')===code)return true;}
+  return false;
+}
+function requireOwner2FA(req,res,next){
+  if(req.account?.role!=='admin')return res.status(403).json({error:'Cần quyền admin.'});
+  if(!totpValid(process.env.ADMIN_TOTP_SECRET,req.headers['x-admin-totp']))return res.status(403).json({error:'Mã xác thực hai bước (TOTP) không hợp lệ.'});
+  next();
+}
+
 async function requireAuth(req, res, next) {
   if (!req.session?.userId) return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại.' });
   try {
@@ -328,7 +440,7 @@ async function saveSession(req) {
 app.get('/api/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, database: 'connected', service: 'urban-catalyst-aether', version: GAME_VERSION, features: ['social','admin','marketplace'] });
+    res.json({ ok: true, database: 'connected', service: 'urban-catalyst-aether', version: GAME_VERSION, features: ['social','admin','marketplace','giftcodes_server','security_audit','market_fees','security_review','gear_plus30_50','gear_affixes','server_crafting'] });
   } catch (_error) {
     res.status(503).json({ ok: false, database: 'unavailable' });
   }
@@ -485,6 +597,130 @@ async function appendMarketEvent(db,uid, event){
   await db.query('UPDATE game_saves SET state=$2::jsonb,updated_at=NOW() WHERE user_id=$1',[uid,JSON.stringify(state)]);
   return { revision:rev, state };
 }
+// -----------------------------------------------------------------------------
+// v6.9: Authorized item forge/enhance/reforge. Player-driven actions are performed
+// inside a PostgreSQL transaction; never trust client-supplied gear stats or rolls.
+// -----------------------------------------------------------------------------
+const GEAR_FORGE_RECIPES=Object.freeze({
+ basic:{stones:12,cores:2,manuals:0,shard:5,gold:9500,weights:[72,24,4,0,0]},
+ refined:{stones:40,cores:7,manuals:2,shard:24,gold:36000,weights:[12,45,32,10,1]},
+ mythic:{stones:100,cores:20,manuals:6,shard:80,gold:125000,weights:[0,12,37,40,11]}
+});
+const GEAR_SET_FAMILIES=['Thiên Tinh','Thâm Uyên','Thủ Hộ','Liệp Ảnh','Aether'];
+const GEAR_AFFIX_POOLS={weapon:['STR','AGI','INT','SPR','LUK','crit','HP'],armor:['VIT','HP','SPR','AGI','MANA','LUK'],accessory:['LUK','INT','AGI','SPR','HP','MANA','crit']};
+const GEAR_AFFIX_LABELS={STR:'Cường Lực',AGI:'Tật Phong',INT:'Trí Tuệ',VIT:'Hộ Thể',SPR:'Linh Tâm',HP:'Sinh Mệnh',MANA:'Linh Hải',LUK:'Thiên Vận',crit:'Bạo Kích'};
+const GEAR_AFFIX_COUNTS={'Thường':0,'Tốt':1,'Hiếm':2,'Sử thi':3,'Huyền thoại':4};
+const GEAR_RARITY_BOOST={'Thường':1,'Tốt':1.12,'Hiếm':1.28,'Sử thi':1.53,'Huyền thoại':1.88};
+const gearServerRand=()=>crypto.randomInt(0,1000001)/1000000;
+const clampGear=(n,min,max)=>Math.max(min,Math.min(max,n));
+function serverRankForLevel(level){const lv=clampGear(Number(level)||1,1,500);return [...GEAR_RANKS].reverse().find(r=>r.name!=='ULR'&&r.minLevel<=lv)||GEAR_RANKS[0];}
+function serverGearMultiplier(item){const lv=Math.min(gearEnhancementCap(item),Math.max(0,Number(item.enhancementLevel)||0));const m=Math.floor(lv/10);return 1+lv*.075+m*.14+(item.equipmentRank==='ULR'?m*.06:0);}
+function serverEffectiveLuk(st){
+ const equipped=Object.values(st.equippedGear||{}).map(uid=>(st.gearInventory||[]).find(g=>g.uid===uid)).filter(Boolean);
+ const families=new Map();for(const g of equipped)if(g.setFamily)families.set(g.setFamily,(families.get(g.setFamily)||0)+1);
+ const strongest=Math.max(0,...families.values());const synergy=strongest>=3?.09:strongest>=2?.04:0;
+ const statBonus=stat=>equipped.reduce((sum,g)=>sum+((Number(g.stats?.[stat])||0)+(g.affixes||[]).reduce((n,a)=>n+(a.stat===stat?Number(a.value)||0:0),0))*serverGearMultiplier(g),0)*(1+synergy);
+ const extraLuck=Math.min(100,equipped.reduce((sum,g)=>sum+(g.special?.type==='luck'?Number(g.special.value)||0:0),0));
+ const luck=(Number(st.luk)||12)+statBonus('LUK')+extraLuck;
+ if(st.classId==='sovereign')return Math.max(1,Math.floor(luck),...['STR','AGI','INT','VIT','SPR'].map(k=>Math.floor((Number(st.stats?.[k])||0)+statBonus(k))));
+ return Math.max(1,Math.min(250,Math.floor(luck)));
+}
+function serverRandomAffixes(slot,rarity,rankName){
+ const count=GEAR_AFFIX_COUNTS[rarity]||0,pool=[...(GEAR_AFFIX_POOLS[slot]||GEAR_AFFIX_POOLS.weapon)],out=[];
+ const rank=GEAR_RANKS.find(r=>r.name===rankName)||GEAR_RANKS[0];const quality=1+Object.keys(GEAR_AFFIX_COUNTS).indexOf(rarity)*.75;
+ for(let n=0;n<count&&pool.length;n++){
+  const at=crypto.randomInt(pool.length),stat=pool.splice(at,1)[0],scale=rank.mult*quality*(.78+gearServerRand()*.44);
+  const base=stat==='crit'?.005:stat==='HP'?12:stat==='MANA'?10:stat==='LUK'?1.5:2.5;
+  const value=stat==='crit'?Number(Math.min(.09,base*scale).toFixed(3)):Math.max(1,Math.floor(base*scale));
+  out.push({id:`affix_${stat.toLowerCase()}`,stat,value,name:GEAR_AFFIX_LABELS[stat]});
+ }
+ return out;
+}
+function serverGearRarity(recipe){let r=crypto.randomInt(100);for(let i=0;i<recipe.weights.length;i++){r-=recipe.weights[i];if(r<0)return GEAR_RARITIES[i].name;}return 'Huyền thoại';}
+function serverGearSpecial(rarity){
+ const choice=GEAR_SPECIALS[crypto.randomInt(GEAR_SPECIALS.length)];
+ const grade=GEAR_RARITIES.find(g=>g.name===rarity)||GEAR_RARITIES[0];
+ const scale=1+Math.max(0,grade.mult-1)*.22;
+ const value=choice.type==='luck'?Math.max(1,Math.round(choice.base*scale)):Number((choice.base*scale).toFixed(3));
+ return {id:choice.id,name:choice.name,type:choice.type,value,desc:choice.desc};
+}
+function serverMakeCraftedGear(key,rarity,rank,username,craftTier){
+ const t=GEAR_TEMPLATES[key],quality=GEAR_RARITIES.find(q=>q.name===rarity)||GEAR_RARITIES[0];
+ const scalar=rank.mult*quality.mult*(GEAR_RARITY_BOOST[rarity]||1),stats={};
+ for(const [stat,value] of Object.entries(t.stats))stats[stat]=stat==='crit'?Number((value*scalar).toFixed(3)):Math.max(1,Math.floor(value*scalar));
+ return {uid:crypto.randomUUID(),key,name:`Tự Chế · ${t.name}`,slot:t.slot,icon:t.icon,rarity,equipmentRank:rank.name,stats,
+  affixes:serverRandomAffixes(t.slot,rarity,rank.name),passives:[],special:serverGearSpecial(rarity),enhancementLevel:0,reforgeCount:0,
+  setFamily:GEAR_SET_FAMILIES[crypto.randomInt(GEAR_SET_FAMILIES.length)],crafted:true,craftedBy:username,craftTier,
+  fuseCount:0,price:Math.max(20,Math.floor(t.price*rank.mult*quality.mult)),requiredLevel:rank.minLevel,noLevelRequirement:false,dropped:false};
+}
+async function serverGearAction(req,res,next,kind){
+ try{
+  const outcome=await withMarketTransaction(async db=>{
+   await lockAccountIds(db,[req.account.id]);
+   const row=await db.query('SELECT state FROM game_saves WHERE user_id=$1 FOR UPDATE',[req.account.id]);
+   if(!row.rowCount||row.rows[0].state.characterCreated!==true)return {error:'Bạn cần tạo nhân vật và đồng bộ save trước.',status:409};
+   const st=row.rows[0].state;st.gearInventory=st.gearInventory||[];
+   let item=null,chargedGold=0;
+   if(kind==='craft'){
+    const key=String(req.body?.key||''),craftTier=String(req.body?.craftTier||'');
+    const t=GEAR_TEMPLATES[key],recipe=GEAR_FORGE_RECIPES[craftTier];
+    if(!t||t.exclusiveOnly||!recipe)return {error:'Bản vẽ/cấp độ rèn không hợp lệ.',status:400};
+    if(st.gearInventory.length>=100)return {error:'Túi trang bị đã đầy 100 món.',status:409};
+    for(const [resource,cost] of Object.entries(recipe))if(resource!=='weights'&&Number(st[resource]||0)<cost)return {error:'Không đủ nguyên liệu để rèn.',status:409};
+    for(const [resource,cost] of Object.entries(recipe))if(resource!=='weights')st[resource]=Math.max(0,Number(st[resource]||0)-cost);
+    chargedGold=recipe.gold;
+    item=serverMakeCraftedGear(key,serverGearRarity(recipe),serverRankForLevel(st.level),req.account.username,craftTier);
+    st.gearInventory.push(item);
+   } else if(kind==='reforge'){
+    const uid=String(req.body?.uid||'');item=st.gearInventory.find(g=>g.uid===uid);
+    if(!item||item.equipmentRank==='ULR'||item.key==='sovereign_arma'||!(GEAR_AFFIX_COUNTS[item.rarity]>0))return {error:'Chỉ tái đúc ấn phụ cho trang bị Tốt+ không phải ULR.',status:400};
+    const rIndex=Object.keys(GEAR_AFFIX_COUNTS).indexOf(item.rarity);
+    const r=GEAR_RANKS.find(g=>g.name===item.equipmentRank)||GEAR_RANKS[0];
+    const costs={cores:2+rIndex*2,shard:5+rIndex*8,stones:3+Math.floor(r.mult*2)};
+    for(const [resource,cost] of Object.entries(costs))if(Number(st[resource]||0)<cost)return {error:'Không đủ nguyên liệu tái đúc.',status:409};
+    for(const [resource,cost] of Object.entries(costs))st[resource]-=cost;
+    item.affixes=serverRandomAffixes(item.slot,item.rarity,item.equipmentRank);
+    if(!item.setFamily)item.setFamily=GEAR_SET_FAMILIES[crypto.randomInt(GEAR_SET_FAMILIES.length)];
+    item.reforgeCount=(Number(item.reforgeCount)||0)+1;
+   } else if(kind==='enhance'){
+    const uid=String(req.body?.uid||'');item=st.gearInventory.find(g=>g.uid===uid);
+    if(!item)return {error:'Không tìm thấy trang bị.',status:404};
+    if(item.equipmentRank==='ULR'&&(req.account.username!==ULR_OWNER||req.account.role!=='admin'))return {error:'ULR chỉ dành cho chủ game.',status:403};
+    const lv=Math.max(0,Math.floor(Number(item.enhancementLevel)||0));
+    if(lv>=gearEnhancementCap(item))return {error:'Trang bị đã đạt trần cường hóa.',status:409};
+    const rank=GEAR_RANKS.find(r=>r.name===item.equipmentRank)||GEAR_RANKS[0];
+    const cores=1+Math.floor(lv/3)+Math.floor(lv/10)*2,gold=Math.floor((2600+rank.mult*1200)*(lv+1)*(1+Math.floor(lv/10)*.13));
+    const shieldRequested=req.body?.protect===true;
+    if(req.body?.protect!==undefined&&typeof req.body.protect!=='boolean')return {error:'Tham số bảo hộ không hợp lệ.',status:400};
+    const risk=enhancementFailureRisk(lv);
+    const shieldCost=shieldRequested?enhancementProtectionCost(lv,rank.mult):{stones:0,shard:0};
+    if(Number(st.cores||0)<cores||Number(st.gold||0)<gold||Number(st.stones||0)<shieldCost.stones||Number(st.shard||0)<shieldCost.shard)return {error:'Không đủ Lõi, tiền hoặc nguyên liệu bảo hộ cường hóa.',status:409};
+    st.cores-=cores;st.gold-=gold;chargedGold=gold;
+    if(shieldRequested){st.stones-=shieldCost.stones;st.shard-=shieldCost.shard;}
+    const equipped=new Set(Object.values(st.equippedGear||{}));
+    const enhanceBonus=st.gearInventory.reduce((sum,g)=>sum+(equipped.has(g.uid)&&g.special?.type==='enhance'?Number(g.special.value)||0:0),0);
+    const curve=gearEnhancementCap(item)===50?.91-lv*.015:.91-lv*.023;
+    const chance=clampGear(curve+Math.max(0,serverEffectiveLuk(st)-12)*.0015+enhanceBonus,.08,.96);
+    const success=gearServerRand()<chance;
+    const outcome=success?{previousLevel:lv,level:lv+1,lostLevels:0,protected:shieldRequested,risk}:resolveEnhancementFailure(lv,gearServerRand(),shieldRequested);
+    item.enhancementLevel=outcome.level;
+    st.lastEnhancement={itemUid:uid,success,chance,previousLevel:lv,level:outcome.level,lostLevels:outcome.lostLevels,protected:shieldRequested,shieldCost,failRisk:risk,at:Date.now()};
+   }
+   const invalid=validateGearUIDs(st);if(invalid)return {error:invalid,status:409};
+   await db.query('UPDATE game_saves SET state=$2::jsonb,updated_at=NOW() WHERE user_id=$1',[req.account.id,JSON.stringify(st)]);
+   if(kind==='craft')await db.query('INSERT INTO economy_uid_registry(uid,owner_id) VALUES($1,$2) ON CONFLICT(uid) DO NOTHING',[item.uid,req.account.id]);
+   await auditEconomy(db,req.account.id,`gear_${kind}`,-chargedGold,{uid:item.uid,key:item.key,rarity:item.rarity,level:item.enhancementLevel,...(kind==='enhance'?{previousLevel:st.lastEnhancement.previousLevel,success:st.lastEnhancement.success,lostLevels:st.lastEnhancement.lostLevels,protected:st.lastEnhancement.protected,shieldCost:st.lastEnhancement.shieldCost}:{})});
+   return {ok:true,item,craftTier:req.body?.craftTier||null,enhancement:kind==='enhance'?st.lastEnhancement:null};
+  });
+  if(outcome.error)return res.status(outcome.status).json({error:outcome.error});
+  res.json(outcome);
+ }catch(error){next(error);}
+}
+const gearActionLimiter=rateLimit({windowMs:60*1000,limit:40,standardHeaders:'draft-7',legacyHeaders:false,message:{error:'Thao tác trang bị quá nhanh; vui lòng thử lại sau.'}});
+app.post('/api/gear/craft',requireAuth,gearActionLimiter,(req,res,next)=>serverGearAction(req,res,next,'craft'));
+app.post('/api/gear/reforge',requireAuth,gearActionLimiter,(req,res,next)=>serverGearAction(req,res,next,'reforge'));
+app.post('/api/gear/enhance',requireAuth,gearActionLimiter,(req,res,next)=>serverGearAction(req,res,next,'enhance'));
+
 app.put('/api/game/save', requireAuth, async (req,res,next)=>{
   if(!savePayloadIsValid(req.body))return res.status(400).json({error:'Dữ liệu lưu game không hợp lệ hoặc vượt giới hạn.'});
   if ((req.account.username!==ULR_OWNER || req.account.role!=='admin') && (req.body.classId==='sovereign' || req.body.sovereignClassUnlocked===true || (Array.isArray(req.body.gearInventory)&&req.body.gearInventory.some(item=>item&&(item.equipmentRank==='ULR'||item.key==='sovereign_arma'))))) return res.status(403).json({error:'ULR và Chí Tôn Nguyên Sơ chỉ dành cho tài khoản Admin lucasmpasi146.'});
@@ -496,6 +732,11 @@ app.put('/api/game/save', requireAuth, async (req,res,next)=>{
       const revision=await getMarketMeta(db,req.account.id);
       const fromRev=Number(req.body.marketRevision||0);
       if(!Number.isSafeInteger(fromRev)||fromRev<0||fromRev>revision) return {error:'Phiên lưu Chợ không hợp lệ, vui lòng tải lại nhân vật.',status:409};
+      const previous=await db.query('SELECT state,updated_at FROM game_saves WHERE user_id=$1 FOR UPDATE',[req.account.id]);
+      const previousState=previous.rows[0]?.state||null;
+      const seconds=previous.rows[0]?Math.max(1,(Date.now()-new Date(previous.rows[0].updated_at).getTime())/1000):1;
+      const suspicious=validateProgressDelta(req.body,previousState,seconds);
+      if(suspicious){await logSecurityIncident(db,req.account.id,'suspicious_save',{reason:suspicious,seconds});return {error:`Dữ liệu tiến trình bị từ chối: ${suspicious}`,status:409};}
       const state={...req.body,accountUsername:req.account.username,lastSeen:Date.now()};
       let deltas=[];
       if(fromRev<revision){
@@ -504,6 +745,13 @@ app.put('/api/game/save', requireAuth, async (req,res,next)=>{
         for(const event of deltas)applyMarketDelta(state,event);
       }
       state.marketRevision=revision;
+      const escrowUids=(state.gearInventory||[]).map(g=>g.uid);
+      if(escrowUids.length){
+        const dupe=await db.query("SELECT item_uid FROM marketplace_listings WHERE seller_id=$1 AND status IN ('active','quarantine') AND item_uid=ANY($2::text[]) LIMIT 1",[req.account.id,escrowUids]);
+        if(dupe.rowCount){await logSecurityIncident(db,req.account.id,'escrow_replay',{uid:dupe.rows[0].item_uid});return {error:'Trang bị đã ký gửi không được xuất hiện trở lại trong túi.',status:409};}
+      }
+      const uidError=await registerSaveUIDs(db,req.account.id,state);
+      if(uidError){await logSecurityIncident(db,req.account.id,'duplicate_uid',{reason:uidError});return {error:uidError,status:409};}
       const updated=await db.query(`INSERT INTO game_saves(user_id,state,updated_at) VALUES($1,$2::jsonb,NOW())
         ON CONFLICT(user_id) DO UPDATE SET state=EXCLUDED.state,updated_at=NOW() RETURNING updated_at`,[req.account.id,JSON.stringify(state)]);
       return {ok:true,updatedAt:updated.rows[0].updated_at,marketRevision:revision,marketDeltas:deltas};
@@ -704,14 +952,16 @@ function validListingId(value){return /^\d{1,19}$/.test(String(value||''));}
 function marketResponseError(error){return {error:error.message||'Không thể thực hiện giao dịch.'};}
 const listingSelect=`l.id::text AS id,l.seller_id::text AS "sellerId",seller.username AS "sellerUsername",
   l.buyer_id::text AS "buyerId", buyer.username AS "buyerUsername", l.item,l.price::text AS price,
-  l.status,l.created_at AS "createdAt",l.closed_at AS "closedAt"`;
+  l.status,l.trade_kind AS "tradeKind",l.wanted_key AS "wantedKey",l.listing_fee::text AS "listingFee",l.sales_tax::text AS "salesTax",l.outlier,l.created_at AS "createdAt",l.closed_at AS "closedAt"`;
 app.get('/api/marketplace/listings',requireAuth,async(req,res,next)=>{
   const search=typeof req.query.search==='string'?req.query.search.trim().slice(0,50):'';
+  const rank=typeof req.query.rank==='string'?req.query.rank.trim().slice(0,8):'';
+  const rarity=typeof req.query.rarity==='string'?req.query.rarity.trim().slice(0,30):'';
   try{
     const result=await pool.query(`SELECT ${listingSelect} FROM marketplace_listings l
       JOIN game_accounts seller ON seller.id=l.seller_id LEFT JOIN game_accounts buyer ON buyer.id=l.buyer_id
-      WHERE l.status='active' AND ($1='' OR l.item->>'name' ILIKE '%' || $1 || '%')
-      ORDER BY l.created_at DESC,l.id DESC LIMIT 80`,[search]);
+      WHERE l.status='active' AND ($1='' OR l.item->>'name' ILIKE '%' || $1 || '%') AND ($2='' OR l.item->>'equipmentRank'=$2) AND ($3='' OR l.item->>'rarity'=$3)
+      ORDER BY l.created_at DESC,l.id DESC LIMIT 80`,[search,rank,rarity]);
     res.json({listings:result.rows});
   }catch(error){next(error);}
 });
@@ -739,6 +989,9 @@ app.post('/api/marketplace/listings',requireAuth,marketActionLimiter,async(req,r
   const resourceKey=typeof req.body?.resourceKey==='string'?req.body.resourceKey:'';
   const quantity=Number(req.body?.quantity);
   const resourceMode=Object.hasOwn(MARKET_RESOURCE_TYPES,resourceKey);
+  const tradeKind=req.body?.tradeKind==='swap'?'swap':'sale';
+  const wantedKey=tradeKind==='swap'?String(req.body?.wantedKey||'').trim():null;
+  if(tradeKind==='swap'&&(resourceMode||!wantedKey||wantedKey.length>72||!/^[a-z_0-9]+$/.test(wantedKey)))return res.status(400).json({error:'Đổi vật phẩm chỉ áp dụng với trang bị và key hợp lệ.'});
   const price=Number(req.body?.price);
   if((!resourceMode&&(uid.length<2||uid.length>128))||(resourceMode&&(!Number.isSafeInteger(quantity)||quantity<1||quantity>9999))||!Number.isSafeInteger(price)||price<10||price>MAX_WALLET_COPPER)return res.status(400).json({error:'Vật phẩm hoặc giá không hợp lệ (10–9.007.199.254.740.991 đồng tệ).'});
   try{
@@ -757,12 +1010,25 @@ app.post('/api/marketplace/listings',requireAuth,marketActionLimiter,async(req,r
         marketUid='resource:'+crypto.randomUUID();
       } else {item=Array.isArray(state.gearInventory)?state.gearInventory.find(i=>i&&i.uid===uid):null;}
       if(!item)return {error:'Trang bị không còn trong túi trên máy chủ; hãy đồng bộ lại.',status:409};
+      if(!marketPriceAllowed(item,price))return {error:'Giá vượt giới hạn giao dịch cho loại hàng.',status:400};
+      const unresolved=await db.query('SELECT 1 FROM security_incidents WHERE user_id=$1 AND resolved=FALSE AND kind=$2 LIMIT 1',[req.account.id,'duplicate_uid']);
+      if(unresolved.rowCount)return {error:'Tài khoản có cảnh báo UID trùng; hãy liên hệ Admin trước khi giao dịch.',status:423};
+      const untrustedUID=await db.query("SELECT item_uid FROM marketplace_listings WHERE seller_id=$1 AND status IN ('active','quarantine') AND item_uid=$2 LIMIT 1",[req.account.id,marketUid]);
+      if(untrustedUID.rowCount)return {error:'Trang bị đang nằm trong tin đăng hoặc kho kiểm duyệt.',status:409};
       if(!['weapon','armor','accessory','material'].includes(item.slot)||typeof item.name!=='string'||!item.name.trim()||item.name.length>120)return {error:'Loại trang bị chưa được hỗ trợ giao dịch.',status:400};
       if(!resourceMode&&state.equippedGear&&Object.values(state.equippedGear).includes(uid))return {error:'Tháo trang bị trước khi đăng bán.',status:409};
       if(!resourceMode&&(item.key==='sovereign_arma'||item.noLevelRequirement===true||item.equipmentRank==='ULR'))return {error:'Vũ khí độc quyền ULR không được giao dịch.',status:403};
-      const ins=await db.query("INSERT INTO marketplace_listings(seller_id,item_uid,item,price) VALUES($1,$2,$3::jsonb,$4) RETURNING id::text AS id",[req.account.id,marketUid,JSON.stringify(item),price]);
-      await appendMarketEvent(db,req.account.id,resourceMode?{resourceDelta:{[resourceKey]:-quantity}}:{goldDelta:0,removedUid:uid});
-      return {ok:true,id:ins.rows[0].id};
+      if(!resourceMode){const invalid=validateGearMetadata(item);if(invalid)return {error:`Trang bị không hợp lệ: ${invalid}`,status:409};}
+      const postingFee=tradeKind==='swap'?100:feeForPrice(price,LISTING_FEE_BPS);
+      if(Number(state.gold||0)<postingFee)return {error:'Không đủ tiền nộp phí đăng bán 1%.',status:409};
+      const recent=await db.query("SELECT price::float8 AS price FROM marketplace_listings WHERE status='sold' AND item->>'key'=$1 ORDER BY id DESC LIMIT 31",[item.key]);
+      const prices=recent.rows.map(r=>Number(r.price)).sort((a,b)=>a-b),median=prices.length?prices[Math.floor(prices.length/2)]:0;
+      const flagged=tradeKind==='sale'&&prices.length>=5&&isOutlierPrice(price,median);
+      const ins=await db.query('INSERT INTO marketplace_listings(seller_id,item_uid,item,price,listing_fee,outlier,trade_kind,wanted_key,status) VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9) RETURNING id::text AS id',[req.account.id,marketUid,JSON.stringify(item),price,postingFee,flagged,tradeKind,wantedKey,flagged?'quarantine':'active']);
+      await appendMarketEvent(db,req.account.id,resourceMode?{goldDelta:-postingFee,resourceDelta:{[resourceKey]:-quantity}}:{goldDelta:-postingFee,removedUid:uid});
+      await auditEconomy(db,req.account.id,'market_post',-postingFee,{id:ins.rows[0].id,uid:marketUid,price,flagged});
+      if(flagged)await logSecurityIncident(db,req.account.id,'price_outlier',{id:ins.rows[0].id,price,median});
+      return {ok:true,id:ins.rows[0].id,quarantined:flagged};
     });
     if(result.error)return res.status(result.status).json({error:result.error});
     res.status(201).json(result);
@@ -781,9 +1047,25 @@ app.post('/api/marketplace/listings/:id/buy',requireAuth,marketActionLimiter,asy
       const seller=saves.rows.find(r=>r.uid===String(l.seller_id))?.state;
       if(!buyer||!seller)return {error:'Người bán hoặc mua chưa có dữ liệu nhân vật.',status:409};
       const price=Number(l.price);
+      if(l.trade_kind==='swap'){
+        const offerUid=String(req.body?.offerUid||'');
+        const offered=Array.isArray(buyer.gearInventory)?buyer.gearInventory.find(g=>g?.uid===offerUid):null;
+        if(!offered||offered.key!==l.wanted_key||offered.equipmentRank==='ULR'||offered.key==='sovereign_arma'||Object.values(buyer.equippedGear||{}).includes(offerUid))return {error:'Bạn phải chọn một trang bị chưa mặc đúng loại mà người bán yêu cầu.',status:409};
+        if((seller.gearInventory||[]).length>=100)return {error:'Túi người bán đã đầy, chưa thể trao đổi.',status:409};
+        if(l.item?.type==='resource'||l.item?.equipmentRank==='ULR'||l.item?.key==='sovereign_arma')return {error:'Loại hàng này không được trao đổi vật phẩm.',status:403};
+        const toBuyer={...l.item,uid:crypto.randomUUID(),dropped:false};
+        const toSeller={...offered,uid:crypto.randomUUID(),dropped:false};
+        await appendMarketEvent(db,req.account.id,{removedUid:offerUid,addedItem:toBuyer});
+        await appendMarketEvent(db,l.seller_id,{addedItem:toSeller});
+        await db.query("UPDATE marketplace_listings SET status='sold',buyer_id=$2,closed_at=NOW() WHERE id=$1",[id,req.account.id]);
+        await auditEconomy(db,req.account.id,'market_swap',0,{listingId:id,offered:offered.key,wanted:l.wanted_key});
+        await db.query('INSERT INTO marketplace_notifications(user_id,message) VALUES($1,$2),($3,$4)',[l.seller_id,`Đã trao đổi ${l.item.name} lấy ${offered.name}.`,req.account.id,`Đổi thành công ${offered.name} lấy ${l.item.name}.`]);
+        return {ok:true,id:String(id),item:toBuyer,name:l.item.name,swapped:true};
+      }
       if(!Number.isSafeInteger(price)||price<10||price>MAX_WALLET_COPPER)return {error:'Giá vật phẩm không hợp lệ.',status:409};
       if(Number(buyer.gold||0)<price)return {error:'Không đủ tiền tệ để mua.',status:409};
-      if(Number(seller.gold||0)+price>MAX_WALLET_COPPER)return {error:'Ví tiền người bán sắp chạm giới hạn lưu trữ.',status:409};
+      const salesTax=feeForPrice(price,SALE_TAX_BPS);const netProceeds=price-salesTax;
+      if(Number(seller.gold||0)+netProceeds>MAX_WALLET_COPPER)return {error:'Ví tiền người bán sắp chạm giới hạn lưu trữ.',status:409};
       if(l.item?.equipmentRank==='ULR'||l.item?.key==='sovereign_arma')return {error:'Vật phẩm ULR độc quyền không được giao dịch.',status:403};
       const resourceMode=l.item?.type==='resource';
       if(!resourceMode&&(buyer.gearInventory||[]).length>=100)return {error:'Túi trang bị đã đầy (100 món).',status:409};
@@ -792,8 +1074,10 @@ app.post('/api/marketplace/listings/:id/buy',requireAuth,marketActionLimiter,asy
       if(resourceMode&&(!Object.hasOwn(MARKET_RESOURCE_TYPES,resourceKey)||!Number.isSafeInteger(quantity)||quantity<1||quantity>9999))return {error:'Vật phẩm đăng bán không hợp lệ.',status:409};
       const incoming=resourceMode?null:{...l.item,uid:crypto.randomUUID(),dropped:false};
       await appendMarketEvent(db,req.account.id,resourceMode?{goldDelta:-price,resourceDelta:{[resourceKey]:quantity}}:{goldDelta:-price,addedItem:incoming});
-      await appendMarketEvent(db,l.seller_id,{goldDelta:price});
-      await db.query("UPDATE marketplace_listings SET status='sold',buyer_id=$2,closed_at=NOW() WHERE id=$1",[id,req.account.id]);
+      await appendMarketEvent(db,l.seller_id,{goldDelta:netProceeds});
+      await db.query("UPDATE marketplace_listings SET status='sold',buyer_id=$2,closed_at=NOW(),sales_tax=$3 WHERE id=$1",[id,req.account.id,salesTax]);
+      await auditEconomy(db,req.account.id,'market_buy',-price,{listingId:id,sellerId:String(l.seller_id),salesTax});
+      await db.query('INSERT INTO marketplace_notifications(user_id,message) VALUES($1,$2),($3,$4)',[l.seller_id,`Đã bán ${l.item.name}: nhận ${netProceeds} Đồng sau thuế 3%.`,req.account.id,`Mua thành công ${l.item.name} giá ${price} Đồng.`]);
       return {ok:true,id:String(id),item:incoming,name:l.item.name,price};
     });
     if(result.error)return res.status(result.status).json({error:result.error});
@@ -805,7 +1089,7 @@ app.post('/api/marketplace/listings/:id/cancel',requireAuth,marketActionLimiter,
   try{
     const result=await withMarketTransaction(async db=>{
       const listingQ=await db.query('SELECT * FROM marketplace_listings WHERE id=$1 FOR UPDATE',[id]);
-      const l=listingQ.rows[0];if(!l||l.status!=='active')return {error:'Tin đăng đã hoàn tất hoặc bị hủy.',status:409};
+      const l=listingQ.rows[0];if(!l||!['active','quarantine'].includes(l.status))return {error:'Tin đăng đã hoàn tất hoặc bị hủy.',status:409};
       if(String(l.seller_id)!==String(req.account.id))return {error:'Bạn không sở hữu tin đăng này.',status:403};
       await lockAccountIds(db,[req.account.id]);
       const q=await db.query('SELECT state FROM game_saves WHERE user_id=$1 FOR UPDATE',[req.account.id]);
@@ -815,6 +1099,7 @@ app.post('/api/marketplace/listings/:id/cancel',requireAuth,marketActionLimiter,
         await appendMarketEvent(db,req.account.id,{resourceDelta:{[l.item.key]:Number(l.item.quantity)}});
       }else await appendMarketEvent(db,req.account.id,{goldDelta:0,addedItem:l.item});
       await db.query("UPDATE marketplace_listings SET status='cancelled',closed_at=NOW() WHERE id=$1",[id]);
+      await auditEconomy(db,req.account.id,'market_cancel',0,{listingId:id});
       return {ok:true,id:String(id)};
     });
     if(result.error)return res.status(result.status).json({error:result.error});
@@ -822,6 +1107,59 @@ app.post('/api/marketplace/listings/:id/cancel',requireAuth,marketActionLimiter,
   }catch(error){next(error);}
 });
 
+
+app.get('/api/marketplace/prices',requireAuth,async(req,res,next)=>{
+ try{const result=await pool.query(`SELECT item->>'key' AS key,item->>'name' AS name,COUNT(*)::int AS trades,
+  ROUND(AVG(price))::text AS avg_price,ROUND((PERCENTILE_CONT(.5) WITHIN GROUP(ORDER BY price::double precision))::numeric)::text AS median_price
+  FROM marketplace_listings WHERE status='sold' AND trade_kind='sale' AND closed_at>NOW()-INTERVAL '30 days'
+  GROUP BY item->>'key',item->>'name' ORDER BY trades DESC LIMIT 40`);
+  res.json({prices:result.rows});}catch(error){next(error);}
+});
+app.get('/api/marketplace/notifications',requireAuth,async(req,res,next)=>{
+ try{const r=await pool.query('SELECT id::text AS id,message,created_at AS "createdAt",read_at AS "readAt" FROM marketplace_notifications WHERE user_id=$1 ORDER BY id DESC LIMIT 30',[req.account.id]);res.json({notifications:r.rows});}catch(error){next(error);}
+});
+
+app.post('/api/game/redeem-code',requireAuth,giftCodeLimiter,async(req,res,next)=>{
+  const code=String(req.body?.code||'').trim().toUpperCase();
+  if(!/^[A-Z0-9_-]{4,48}$/.test(code))return res.status(400).json({error:'Định dạng mã không hợp lệ.'});
+  const digest=giftCodeDigest(code);
+  try{
+    const out=await withMarketTransaction(async db=>{
+      await lockAccountIds(db,[req.account.id]);
+      const q=await db.query('SELECT reward,expires_at,usage_limit FROM gift_codes WHERE digest=$1 AND active=TRUE FOR UPDATE',[digest]);
+      if(!q.rowCount || q.rows[0].expires_at&&new Date(q.rows[0].expires_at)<new Date())return {error:'Mã không tồn tại hoặc đã hết hạn.',status:404};
+      const used=await db.query('SELECT 1 FROM gift_redemptions WHERE user_id=$1 AND digest=$2',[req.account.id,digest]);
+      if(used.rowCount)return {error:'Tài khoản đã sử dụng mã này.',status:409};
+      if(q.rows[0].usage_limit){const count=await db.query('SELECT COUNT(*)::int AS n FROM gift_redemptions WHERE digest=$1',[digest]);if(count.rows[0].n>=q.rows[0].usage_limit)return {error:'Mã đã hết lượt sử dụng.',status:409};}
+      const saved=await db.query('SELECT state FROM game_saves WHERE user_id=$1 FOR UPDATE',[req.account.id]);
+      if(!saved.rowCount)return {error:'Cần tạo nhân vật và lưu lên server trước khi đổi mã.',status:409};
+      const st=saved.rows[0].state,r=q.rows[0].reward;
+      if(r.sovereignClass){
+        if(req.account.username!==ULR_OWNER||req.account.role!=='admin')return {error:'Mã này yêu cầu quyền chủ game.',status:403};
+        if(st.sovereignClassUnlocked)return {error:'Đặc quyền đã được mở khóa.',status:409};
+        if((st.gearInventory||[]).length>=100)return {error:'Túi trang bị đã đầy.',status:409};
+        const bonus=Math.max(0,Math.floor((Number(st.level)||1)*20+50));
+        st.sovereignClassUnlocked=true;st.sovereignApCompensationClaimed=true;st.sovereignApCompensationTotal=bonus;st.ap=Number(st.ap||0)+bonus;st.classId='sovereign';
+        st.classProgress=st.classProgress||{};st.classProgress.sovereign=st.classProgress.sovereign||{branch:null,capstone:null};
+        st.gearInventory=st.gearInventory||[];
+        if(!st.gearInventory.some(g=>g.key==='sovereign_arma')){
+          const uid=crypto.randomUUID();st.gearInventory.push({uid,key:'sovereign_arma',name:'ULR · Thần Khí Khai Thiên',slot:'weapon',icon:'🗡️',rarity:'Huyền thoại',equipmentRank:'ULR',stats:{STR:90,AGI:90,INT:90,VIT:90,SPR:90,HP:600,MANA:500,LUK:44,crit:0.18},special:{id:'ap_value_double',name:'Định Luật AP ×2',type:'apValue',value:2,desc:'Khi trang bị, mỗi 1 AP phân bổ tăng +2 chỉ số.'},affixes:[{id:'ulr_str',stat:'STR',value:66,name:'Nguyên Lực Tối Thượng'},{id:'ulr_agi',stat:'AGI',value:66,name:'Tốc Độ Thời Không'},{id:'ulr_int',stat:'INT',value:66,name:'Chân Tri Khởi Nguyên'},{id:'ulr_vit',stat:'VIT',value:66,name:'Bất Diệt Thần Thể'},{id:'ulr_spr',stat:'SPR',value:66,name:'Vạn Linh Quy Tâm'},{id:'ulr_luk',stat:'LUK',value:50,name:'Thiên Mệnh Độc Tôn'},{id:'ulr_crit',stat:'crit',value:0.12,name:'Thần Nhãn Tuyệt Đối'}],passives:[{type:'bossDamage',name:'Trảm Boss Nguyên Sơ',value:0.25},{type:'lifesteal',name:'Huyết Mạch Vĩnh Hằng',value:0.09},{type:'dodge',name:'Xuyên Giới',value:0.08},{type:'xp',name:'Tăng Tri',value:0.20}],setFamily:'Khởi Nguyên',enhancementLevel:0,reforgeCount:0,fuseCount:0,price:0,requiredLevel:0,noLevelRequirement:true,dropped:false});
+          st.equippedGear={...(st.equippedGear||{}),weapon:uid};
+        }
+      }
+      for(const key of ['gold','shard','stones','cores','manuals','hpPotions','manaPotions']){
+        const amount=Number(r[key]||0);if(amount)st[key]=Math.min(key==='gold'?MAX_WALLET_COPPER:1e9,Math.max(0,Number(st[key]||0)+amount));
+      }
+      if(r.fragments){st.hiddenPaperFragments=Math.min(1e9,Number(st.hiddenPaperFragments||0)+r.fragments);while(st.hiddenPaperFragments>=50){st.hiddenPaperFragments-=50;st.hiddenClassPapers=(Number(st.hiddenClassPapers)||0)+1;}}
+      await db.query('INSERT INTO gift_redemptions(user_id,digest) VALUES($1,$2)',[req.account.id,digest]);
+      await db.query('UPDATE game_saves SET state=$2::jsonb,updated_at=NOW() WHERE user_id=$1',[req.account.id,JSON.stringify(st)]);
+      await auditEconomy(db,req.account.id,'giftcode',Number(r.gold||0),{reward:r});
+      return {ok:true,reward:r,state:st};
+    });
+    if(out.error)return res.status(out.status||400).json({error:out.error});
+    res.json(out);
+  }catch(error){next(error);}
+});
 app.get('/api/admin/status',requireAuth,async(req,res,next)=>{
   const configured=(process.env.ADMIN_USERNAME||'').trim().toLowerCase();
   const canReadAdminWarning=req.account.username===configured||req.account.role==='admin';
@@ -831,6 +1169,34 @@ app.get('/api/admin/status',requireAuth,async(req,res,next)=>{
 });
 
 // Admin API: every operation is authorized against the database role, never a client-supplied flag.
+
+app.post('/api/admin/roles',requireAdmin,adminActionLimiter,requireOwner2FA,async(req,res,next)=>{
+ const name=String(req.body?.username||'').trim().toLowerCase();const role=String(req.body?.role||'');
+ if(!validUsername(name)||!['player','moderator','gm'].includes(role))return res.status(400).json({error:'Role hoặc username không hợp lệ. Quyền admin chỉ được cấp từ Render.'});
+ try{const target=await pool.query("SELECT id,username,role FROM game_accounts WHERE username=$1",[name]);if(!target.rowCount)return res.status(404).json({error:'Không tìm thấy tài khoản.'});
+ if(target.rows[0].role==='admin'||name===ULR_OWNER)return res.status(403).json({error:'Không thay đổi role chủ game/Admin bằng API này.'});
+ await pool.query('UPDATE game_accounts SET role=$2 WHERE id=$1',[target.rows[0].id,role]);await recordAdminAction(req.account.id,'set_role',target.rows[0].id,{previous:target.rows[0].role,role});res.json({ok:true,username:name,role});
+ }catch(error){next(error);}
+});
+app.get('/api/admin/security',requireAdmin,async(req,res,next)=>{
+ try{const incidents=await pool.query(`SELECT i.id::text AS id,i.kind,i.details,i.resolved,i.created_at AS "createdAt",a.username
+ FROM security_incidents i LEFT JOIN game_accounts a ON a.id=i.user_id ORDER BY i.id DESC LIMIT 100`);res.json({incidents:incidents.rows});}catch(error){next(error);}
+});
+app.post('/api/admin/security/:id/resolve',requireAdmin,adminActionLimiter,requireOwner2FA,async(req,res,next)=>{
+ if(!/^\d{1,18}$/.test(String(req.params.id)))return res.status(400).json({error:'ID không hợp lệ.'});
+ try{await pool.query('UPDATE security_incidents SET resolved=TRUE WHERE id=$1',[req.params.id]);await recordAdminAction(req.account.id,'resolve_security',null,{incidentId:req.params.id});res.json({ok:true});}catch(error){next(error);}
+});
+app.get('/api/admin/economy',requireAdmin,async(req,res,next)=>{
+ try{
+  const [sales,taxes,flags,currency,duplicates]=await Promise.all([
+    pool.query("SELECT COUNT(*)::int AS count,COALESCE(SUM(price),0)::text AS volume FROM marketplace_listings WHERE status='sold' AND trade_kind='sale' AND closed_at>NOW()-INTERVAL '30 days'"),
+    pool.query("SELECT COALESCE(SUM(listing_fee),0)::text AS listing_fees,COALESCE(SUM(sales_tax),0)::text AS sale_taxes FROM marketplace_listings WHERE created_at>NOW()-INTERVAL '30 days'"),
+    pool.query('SELECT COUNT(*)::int AS count FROM security_incidents WHERE resolved=FALSE'),
+    pool.query("SELECT COALESCE(SUM((state->>'gold')::numeric),0)::text AS total FROM game_saves WHERE state->>'gold' ~ '^[0-9]+$'"),
+    pool.query("SELECT uid,COUNT(*)::int AS n FROM (SELECT user_id,jsonb_array_elements(COALESCE(state->'gearInventory','[]'::jsonb))->>'uid' AS uid FROM game_saves) AS g GROUP BY uid HAVING COUNT(*)>1 LIMIT 20")]);
+  res.json({sales:sales.rows[0],taxes:taxes.rows[0],flags:flags.rows[0],wallets:currency.rows[0],duplicateUids:duplicates.rows});
+ }catch(error){next(error);}
+});
 app.get('/api/admin/overview', requireAdmin, async (req, res, next) => {
   try {
     const [accounts, online, banned, muted] = await Promise.all([
@@ -935,6 +1301,59 @@ app.get('/api/admin/audit', requireAdmin, async (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
+
+// Role boundaries: moderator can delete violating world messages; GM requests high-risk changes and cannot self-approve.
+function requireModerator(req,res,next){requireAuth(req,res,()=>userCanModerate(req)?next():res.status(403).json({error:'Cần quyền Moderator hoặc Admin.'}));}
+function requireGM(req,res,next){requireAuth(req,res,()=>['gm','admin'].includes(req.account.role)?next():res.status(403).json({error:'Cần quyền GM hoặc Admin.'}));}
+app.delete('/api/mod/world/:id',requireModerator,adminActionLimiter,async(req,res,next)=>{
+ try{if(!/^\d{1,18}$/.test(String(req.params.id)))return res.status(400).json({error:'ID không hợp lệ.'});
+ const msg=await pool.query("DELETE FROM social_messages WHERE id=$1 AND channel='world' RETURNING id,sender_id,message",[req.params.id]);
+ if(!msg.rowCount)return res.status(404).json({error:'Không tìm thấy tin nhắn.'});
+ await recordAdminAction(req.account.id,'moderate_delete',msg.rows[0].sender_id,{id:req.params.id,message:msg.rows[0].message.slice(0,100)});res.json({ok:true});
+ }catch(error){next(error);}
+});
+app.post('/api/gm/requests',requireGM,adminActionLimiter,async(req,res,next)=>{
+ const username=String(req.body?.username||'').trim().toLowerCase(),action=String(req.body?.action||''),amount=Number(req.body?.amount);
+ if(!validUsername(username)||!['restore_hp','grant_xp'].includes(action)||!Number.isSafeInteger(amount)||amount<1||amount>10000)return res.status(400).json({error:'Giới hạn yêu cầu GM: 1–10.000.'});
+ try{const target=await pool.query('SELECT id FROM game_accounts WHERE username=$1',[username]);if(!target.rowCount)return res.status(404).json({error:'Tài khoản không tồn tại.'});
+ const count=await pool.query("SELECT COUNT(*)::int AS n FROM gm_requests WHERE requester_id=$1 AND status='pending'",[req.account.id]);if(count.rows[0].n>=10)return res.status(429).json({error:'Tối đa 10 yêu cầu đang chờ.'});
+ const q=await pool.query('INSERT INTO gm_requests(requester_id,target_id,action,amount,reason) VALUES($1,$2,$3,$4,$5) RETURNING id::text AS id',[req.account.id,target.rows[0].id,action,amount,String(req.body?.reason||'').slice(0,200)]);
+ await recordAdminAction(req.account.id,'gm_request',target.rows[0].id,{requestId:q.rows[0].id,action,amount});res.status(201).json({ok:true,id:q.rows[0].id});
+ }catch(error){next(error);}
+});
+app.get('/api/admin/gm-requests',requireAdmin,async(req,res,next)=>{
+ try{const q=await pool.query(`SELECT r.id::text AS id,r.action,r.amount,r.reason,r.status,r.created_at AS "createdAt",requester.username AS requester,target.username AS target
+ FROM gm_requests r JOIN game_accounts requester ON requester.id=r.requester_id JOIN game_accounts target ON target.id=r.target_id ORDER BY r.id DESC LIMIT 100`);res.json({requests:q.rows});}catch(error){next(error);}
+});
+app.post('/api/admin/gm-requests/:id/review',requireAdmin,adminActionLimiter,requireOwner2FA,async(req,res,next)=>{
+ const id=String(req.params.id||''),approve=req.body?.approve===true;
+ if(!/^\d{1,18}$/.test(id))return res.status(400).json({error:'Yêu cầu không hợp lệ.'});
+ try{const result=await withMarketTransaction(async db=>{
+  const q=await db.query('SELECT * FROM gm_requests WHERE id=$1 FOR UPDATE',[id]);const r=q.rows[0];
+  if(!r||r.status!=='pending')return {error:'Yêu cầu đã xử lý.',status:409};
+  if(String(r.requester_id)===String(req.account.id))return {error:'Không được tự duyệt yêu cầu của chính mình.',status:403};
+  if(approve){const save=await db.query('SELECT state FROM game_saves WHERE user_id=$1 FOR UPDATE',[r.target_id]);if(!save.rowCount)return {error:'Nhân vật không có save.',status:404};
+    const st=save.rows[0].state;
+    if(r.action==='grant_xp')st.xp=Math.min(1e12,Number(st.xp||0)+r.amount);
+    else if(r.action==='restore_hp')st.hp=Math.min(1e10,Number(st.hp||0)+r.amount);
+    await db.query('UPDATE game_saves SET state=$2::jsonb,updated_at=NOW() WHERE user_id=$1',[r.target_id,JSON.stringify(st)]);
+  }
+  await db.query('UPDATE gm_requests SET status=$2,reviewed_by=$3,reviewed_at=NOW() WHERE id=$1',[id,approve?'approved':'rejected',req.account.id]);
+  await db.query('INSERT INTO admin_audit_log(actor_id,target_id,action,details) VALUES($1,$2,$3,$4::jsonb)',[req.account.id,r.target_id,approve?'gm_approved':'gm_rejected',JSON.stringify({requestId:id,type:r.action,amount:r.amount})]);
+  return {ok:true,approved:approve};
+ });if(result.error)return res.status(result.status).json({error:result.error});res.json(result);
+ }catch(error){next(error);}
+});
+app.get('/api/admin/quarantined',requireAdmin,async(req,res,next)=>{
+ try{const r=await pool.query(`SELECT l.id::text AS id,l.item,l.price::text AS price,l.created_at AS "createdAt",a.username
+ FROM marketplace_listings l JOIN game_accounts a ON a.id=l.seller_id WHERE l.status='quarantine' ORDER BY l.id DESC LIMIT 80`);res.json({listings:r.rows});}catch(error){next(error);}
+});
+app.post('/api/admin/quarantined/:id/approve',requireAdmin,adminActionLimiter,requireOwner2FA,async(req,res,next)=>{
+ const id=String(req.params.id||'');if(!/^\d{1,18}$/.test(id))return res.status(400).json({error:'ID không hợp lệ.'});
+ try{const q=await pool.query("UPDATE marketplace_listings SET status='active' WHERE id=$1 AND status='quarantine' RETURNING seller_id",[id]);
+ if(!q.rowCount)return res.status(409).json({error:'Tin không chờ duyệt.'});await recordAdminAction(req.account.id,'approve_trade',q.rows[0].seller_id,{listingId:id});res.json({ok:true});
+ }catch(error){next(error);}
+});
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], maxAge: isProduction ? '1h' : 0,
   setHeaders(res,resourcePath){if(resourcePath.endsWith('index.html'))res.setHeader('Cache-Control','no-store');} }));
 app.get('*', (_req,res) => { if(!existsSync(PUBLIC_INDEX))return res.status(503).send('Thiếu public/index.html trên Render. Hãy upload nguyên thư mục public/ ở gốc repo và deploy bản đầy đủ.'); res.sendFile(PUBLIC_INDEX,{headers:{'Cache-Control':'no-store'}}); });
@@ -945,6 +1364,7 @@ app.use((error, _req, res, _next) => {
   if (res.headersSent) return;
   res.status(500).json({ error: `Máy chủ gặp lỗi. Mã tham chiếu: ${errorId}` });
 });
+
 
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`Urban Catalyst Aether server đang chạy tại cổng ${port}`);

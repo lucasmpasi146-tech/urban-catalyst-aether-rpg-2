@@ -18,7 +18,10 @@ const isProduction = process.env.NODE_ENV === 'production';
 const port = Number(process.env.PORT || 3000);
 const databaseUrl = process.env.DATABASE_URL;
 const sessionSecret = process.env.SESSION_SECRET;
-const GAME_VERSION = '6.5.0';
+const GAME_VERSION = '6.6.0';
+const ULR_OWNER = 'lucasmpasi146';
+const COPPER_PER_PLATINUM=1000000;
+const MAX_WALLET_COPPER=9007199254740991;
 let adminBootstrapWarning = '';
 const PUBLIC_INDEX = path.join(__dirname, 'public', 'index.html');
 if (!existsSync(PUBLIC_INDEX)) {
@@ -175,7 +178,7 @@ async function initializeDatabase() {
       buyer_id BIGINT REFERENCES game_accounts(id) ON DELETE SET NULL,
       item_uid TEXT NOT NULL,
       item JSONB NOT NULL CHECK (jsonb_typeof(item)='object'),
-      price BIGINT NOT NULL CHECK (price BETWEEN 10 AND 1000000000),
+      price BIGINT NOT NULL CHECK (price BETWEEN 10 AND 9007199254740991),
       status VARCHAR(12) NOT NULL DEFAULT 'active' CHECK (status IN ('active','sold','cancelled')),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       closed_at TIMESTAMPTZ
@@ -184,9 +187,72 @@ async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS marketplace_listings_seller_idx ON marketplace_listings(seller_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS marketplace_listings_buyer_idx ON marketplace_listings(buyer_id, closed_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS marketplace_one_active_uid_idx ON marketplace_listings(seller_id, item_uid) WHERE status='active';
+    ALTER TABLE marketplace_listings DROP CONSTRAINT IF EXISTS marketplace_listings_price_check;
+    ALTER TABLE marketplace_listings ADD CONSTRAINT marketplace_listings_price_check CHECK (price BETWEEN 10 AND 9007199254740991);
     UPDATE game_accounts SET last_active_at = COALESCE(last_active_at, created_at);
   `);
+  await migrateCurrencyV2();
   await bootstrapConfiguredAdmin();
+}
+
+
+// v6.6: one-way, one-time conversion of old Aether Coin balances to copper units.
+// Existing Coin was defined as platinum: 1 Coin = 1 Platinum = 1,000,000 copper.
+async function migrateCurrencyV2(){
+  const db=await pool.connect();
+  try{
+    await db.query('BEGIN');
+    await db.query('SELECT pg_advisory_xact_lock(66160266)');
+    await db.query(`CREATE TABLE IF NOT EXISTS game_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    const done=await db.query('SELECT 1 FROM game_migrations WHERE name=$1',['currency_v2_copper_2026']);
+    if(done.rowCount){await db.query('COMMIT');return;}
+    // Never silently discard legacy money. Check before multiplying by 1,000,000.
+    const overflow=await db.query(`SELECT ga.username FROM game_saves gs
+      JOIN game_accounts ga ON ga.id=gs.user_id
+      WHERE COALESCE((gs.state->>'currencyVersion')::integer,1)<2
+        AND COALESCE(NULLIF(gs.state->>'gold','')::numeric,0)>9007199254
+      LIMIT 5`);
+    if(overflow.rowCount)throw new Error('Ví Aether Coin vượt giới hạn di trú an toàn cho: '+overflow.rows.map(r=>r.username).join(', ')+'; hãy sao lưu và xử lý riêng.');
+    // Keep all calculations exact in PostgreSQL NUMERIC. Preserve guard fields inside save JSON.
+    await db.query(`UPDATE game_saves SET state = jsonb_set(jsonb_set(state, '{gold}',
+      to_jsonb(LEAST(9007199254740991::numeric, GREATEST(0::numeric, TRUNC(COALESCE(NULLIF(state->>'gold','')::numeric,0)*1000000))))),
+      '{currencyVersion}','2'::jsonb), updated_at=NOW()
+      WHERE COALESCE((state->>'currencyVersion')::integer,1)<2`);
+    await db.query(`UPDATE marketplace_events SET gold_delta = CASE
+      WHEN gold_delta>0 THEN LEAST(9007199254740991::bigint,gold_delta::numeric*1000000)
+      WHEN gold_delta<0 THEN GREATEST(-9007199254740991::bigint,gold_delta::numeric*1000000)
+      ELSE 0 END`);
+    await db.query('UPDATE marketplace_listings SET price=price*1000000');
+    await db.query("UPDATE marketplace_listings SET status='cancelled',closed_at=NOW() WHERE status='active' AND (item->>'equipmentRank'='ULR' OR item->>'key'='sovereign_arma')");
+    // ULR is owner-only. For old saves, remove ULR gear from non-owner accounts
+    // and return players with now-forbidden class to a regular starter class.
+    const legacy=await db.query(`SELECT gs.user_id,gs.state,ga.username FROM game_saves gs
+      JOIN game_accounts ga ON ga.id=gs.user_id FOR UPDATE`);
+    for(const row of legacy.rows){
+      const st=row.state;const gear=Array.isArray(st.gearInventory)?st.gearInventory:[];
+      // Reprice legacy equipment's resale value to the new Black Market baseline.
+      for(const item of gear){
+        if(item&&Number.isFinite(Number(item.price))&&Number(item.price)>0){
+          item.price=Math.min(MAX_WALLET_COPPER,Math.floor(Number(item.price)*100));
+        }
+      }
+      if(st.guildQuest&&Number.isFinite(Number(st.guildQuest.rewardGold)))
+        st.guildQuest.rewardGold=Math.min(MAX_WALLET_COPPER,Math.floor(Number(st.guildQuest.rewardGold)*25));
+      if(row.username!==ULR_OWNER){
+        const valid=gear.filter(g=>g&&g.equipmentRank!=='ULR'&&g.key!=='sovereign_arma');
+        st.gearInventory=valid;
+        const validUids=new Set(valid.map(g=>g.uid));
+        if(st.equippedGear)for(const slot of ['weapon','armor','accessory'])if(st.equippedGear[slot]&&!validUids.has(st.equippedGear[slot]))st.equippedGear[slot]=null;
+        if(st.classId==='sovereign')st.classId='music';
+        st.sovereignClassUnlocked=false;st.sovereignApCompensationClaimed=false;
+      }
+      await db.query('UPDATE game_saves SET state=$2::jsonb,updated_at=NOW() WHERE user_id=$1',[row.user_id,JSON.stringify(st)]);
+    }
+    await db.query('INSERT INTO game_migrations(name) VALUES($1)',['currency_v2_copper_2026']);
+    await db.query('COMMIT');
+    console.log('Đã chuyển tiền Aether Coin -> 4 mệnh giá (đồng tệ) đúng một lần.');
+  }catch(error){await db.query('ROLLBACK').catch(()=>{});throw error;}
+  finally{db.release();}
 }
 
 async function bootstrapConfiguredAdmin() {
@@ -249,7 +315,8 @@ function savePayloadIsValid(value) {
   if (typeof value.characterName !== 'string' || value.characterName.trim().length < 3 || value.characterName.length > 20) return false;
   if (!Number.isFinite(Number(value.level)) || Number(value.level) < 1 || Number(value.level) > 500) return false;
   if (!Number.isFinite(Number(value.xp)) || Number(value.xp) < 0 || Number(value.xp) > 1e12) return false;
-  if (!Number.isFinite(Number(value.gold)) || Number(value.gold) < 0 || Number(value.gold) > 1e15) return false;
+  if (!Number.isSafeInteger(Number(value.gold)) || Number(value.gold) < 0 || Number(value.gold) > MAX_WALLET_COPPER) return false;
+  if (value.currencyVersion !== 2) return false;
   if (!Number.isFinite(Number(value.ap)) || Number(value.ap) < 0 || Number(value.ap) > 1e9) return false;
   if (!value.stats || typeof value.stats !== 'object' || Array.isArray(value.stats)) return false;
   return true;
@@ -386,7 +453,7 @@ async function getMarketMeta(db, userId) {
   const result=await db.query('SELECT revision FROM marketplace_meta WHERE user_id=$1', [userId]);
   return Number(result.rows[0]?.revision||0);
 }
-const MARKET_RESOURCE_TYPES={stones:{name:'Ma Thạch',icon:'💎'},shard:{name:'Void Shard',icon:'✧'},cores:{name:'Lõi Aether',icon:'◈'},manuals:{name:'Bí Cấp',icon:'📜'},hpPotions:{name:'Bình HP',icon:'❤️'},manaPotions:{name:'Bình Mana',icon:'💧'}};
+const MARKET_RESOURCE_TYPES={classTransferTickets:{name:'Giấy Chuyển Class Thường',icon:'📃'},stones:{name:'Ma Thạch',icon:'💎'},shard:{name:'Void Shard',icon:'✧'},cores:{name:'Lõi Aether',icon:'◈'},manuals:{name:'Bí Cấp',icon:'📜'},hpPotions:{name:'Bình HP',icon:'❤️'},manaPotions:{name:'Bình Mana',icon:'💧'}};
 function applyMarketDelta(state,event){
   const resource=event.resource_delta??event.resourceDelta??{};
   for(const [key,change] of Object.entries(resource)){
@@ -394,7 +461,7 @@ function applyMarketDelta(state,event){
     state[key]=Math.min(1e9,Math.max(0,Math.floor(Number(state[key])||0)+change));
   }
   const gold = Number(event.gold_delta??event.goldDelta??0);
-  state.gold = Math.min(1e15,Math.max(0,Math.floor(Number(state.gold)||0)+gold));
+  state.gold = Math.min(MAX_WALLET_COPPER,Math.max(0,Math.floor(Number(state.gold)||0)+gold));
   if(!Array.isArray(state.gearInventory)) state.gearInventory=[];
   const removed=event.removed_uid??event.removedUid;
   if(removed){state.gearInventory=state.gearInventory.filter(item=>item?.uid!==removed);
@@ -420,6 +487,7 @@ async function appendMarketEvent(db,uid, event){
 }
 app.put('/api/game/save', requireAuth, async (req,res,next)=>{
   if(!savePayloadIsValid(req.body))return res.status(400).json({error:'Dữ liệu lưu game không hợp lệ hoặc vượt giới hạn.'});
+  if ((req.account.username!==ULR_OWNER || req.account.role!=='admin') && (req.body.classId==='sovereign' || req.body.sovereignClassUnlocked===true || (Array.isArray(req.body.gearInventory)&&req.body.gearInventory.some(item=>item&&(item.equipmentRank==='ULR'||item.key==='sovereign_arma'))))) return res.status(403).json({error:'ULR và Chí Tôn Nguyên Sơ chỉ dành cho tài khoản Admin lucasmpasi146.'});
   const serialized=JSON.stringify(req.body);
   if(Buffer.byteLength(serialized,'utf8')>400*1024)return res.status(413).json({error:'Dữ liệu lưu game quá lớn.'});
   try {
@@ -672,7 +740,7 @@ app.post('/api/marketplace/listings',requireAuth,marketActionLimiter,async(req,r
   const quantity=Number(req.body?.quantity);
   const resourceMode=Object.hasOwn(MARKET_RESOURCE_TYPES,resourceKey);
   const price=Number(req.body?.price);
-  if((!resourceMode&&(uid.length<2||uid.length>128))||(resourceMode&&(!Number.isSafeInteger(quantity)||quantity<1||quantity>9999))||!Number.isSafeInteger(price)||price<10||price>1000000000)return res.status(400).json({error:'Vật phẩm hoặc giá không hợp lệ (10–1.000.000.000 Coin).'});
+  if((!resourceMode&&(uid.length<2||uid.length>128))||(resourceMode&&(!Number.isSafeInteger(quantity)||quantity<1||quantity>9999))||!Number.isSafeInteger(price)||price<10||price>MAX_WALLET_COPPER)return res.status(400).json({error:'Vật phẩm hoặc giá không hợp lệ (10–9.007.199.254.740.991 đồng tệ).'});
   try{
     const result=await withMarketTransaction(async db=>{
       await lockAccountIds(db,[req.account.id]);
@@ -713,8 +781,10 @@ app.post('/api/marketplace/listings/:id/buy',requireAuth,marketActionLimiter,asy
       const seller=saves.rows.find(r=>r.uid===String(l.seller_id))?.state;
       if(!buyer||!seller)return {error:'Người bán hoặc mua chưa có dữ liệu nhân vật.',status:409};
       const price=Number(l.price);
-      if(!Number.isSafeInteger(price)||price<10||price>1e9)return {error:'Giá vật phẩm không hợp lệ.',status:409};
-      if(Number(buyer.gold||0)<price)return {error:'Không đủ Aether Coin để mua.',status:409};
+      if(!Number.isSafeInteger(price)||price<10||price>MAX_WALLET_COPPER)return {error:'Giá vật phẩm không hợp lệ.',status:409};
+      if(Number(buyer.gold||0)<price)return {error:'Không đủ tiền tệ để mua.',status:409};
+      if(Number(seller.gold||0)+price>MAX_WALLET_COPPER)return {error:'Ví tiền người bán sắp chạm giới hạn lưu trữ.',status:409};
+      if(l.item?.equipmentRank==='ULR'||l.item?.key==='sovereign_arma')return {error:'Vật phẩm ULR độc quyền không được giao dịch.',status:403};
       const resourceMode=l.item?.type==='resource';
       if(!resourceMode&&(buyer.gearInventory||[]).length>=100)return {error:'Túi trang bị đã đầy (100 món).',status:409};
       const resourceKey=resourceMode?l.item.key:null;
